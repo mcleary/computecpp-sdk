@@ -274,9 +274,25 @@ class GravSim {
           num_t G = m_grav_params.G;
           num_t damping = m_grav_params.damping;
 
+          static constexpr num_t p = 256;
+
+          sycl::accessor<vec3<num_t>, 1, sycl::access::mode::read_write,
+                         sycl::access::target::local>
+              shared(sycl::range<1>(256), cgh);
+
+          sycl::range<1> global(m_n_bodies);
+          sycl::range<1> local(m_n_bodies / p);
+          sycl::nd_range range(global, local);
+
           cgh.parallel_for<kernel<num_t, 0>>(
-              cl::sycl::range<1>(m_n_bodies), [=](cl::sycl::item<1> item) {
-                auto id = item.get_linear_id();
+              range, [=](cl::sycl::nd_item<1> item) {
+
+                size_t id = item.get_global_linear_id();
+                size_t N = item.get_global_range()[0];
+
+                size_t localId = item.get_local_linear_id();
+                size_t groupId = item.get_group_linear_id();
+                size_t numGroups = item.get_num_groups()[0];
 
                 // Computes the gravitational acceleration on a body using the
                 // chosen constants
@@ -284,14 +300,33 @@ class GravSim {
                                       num_t) -> vec3<num_t> {
                   vec3<num_t> acc(0);
 
+                  #if 1
+
+                  size_t start = 0;
+                  size_t tile = 0;
+                  size_t finish = N;
+
+                  #define WRAP(x, m) (((x) < m) ? (x) : (x - m))
+
+                  for (size_t i = 0; i < finish; i += p, tile++) {
+                    shared[localId] = pos[WRAP(groupId + tile, numGroups) * numGroups + localId];
+                    item.barrier(sycl::access::fence_space::local_space);
+                    for (size_t j = 0; j < p; ++j) {
+                      const vec3<num_t> diff = shared[localId] - x;
+                      const num_t r = sycl::sqrt(sycl::dot(diff, diff));
+                      acc += diff / (r * r * r + num_t(1e24) + damping);
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                  }
+
+                  #else
                   for (size_t i = 0; i < n_bodies; i++) {
                     auto const diff = pos[i] - x;
-                    auto const r =
-                        sycl::sqrt(diff.x() * diff.x() + diff.y() * diff.y() +
-                                   diff.z() * diff.z());
+                    auto const r = sycl::sqrt(sycl::dot(diff, diff));
                     acc += diff /
                            (r * r * r + num_t(1e24) * num_t(i == id) + damping);
                   }
+                  #endif
 
                   return G * acc;
                 };
