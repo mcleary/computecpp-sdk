@@ -45,6 +45,10 @@
 using num_t = float;
 constexpr num_t PI = num_t(3.141592653589793238462643383279502884197169399);
 
+using fps_clock = std::chrono::high_resolution_clock;
+using time_point = fps_clock::time_point;
+using duration = time_point::duration;
+
 class NBodyApp
 #ifdef CODEPLAY_DRAW_LOGO
     : public CodeplayDemoApp
@@ -76,7 +80,9 @@ class NBodyApp
     float max_radius = 25;
   } m_ui_distrib_sphere_params;
 
-  int32_t m_ui_n_bodies = 1024;
+  int32_t m_ui_n_bodies = 16384;
+
+  int32_t m_ui_tileSize = 256;
 
   const int32_t m_num_updates_per_frame = 1;
   int32_t m_num_updates = 0;
@@ -117,6 +123,11 @@ class NBodyApp
     UI_INTEGRATOR_RK4 = 1,
   };
   int32_t m_ui_integrator_id = UI_INTEGRATOR_EULER;
+
+  time_point m_currentTime = fps_clock::now();
+  time_point m_previousTime = fps_clock::now();
+  num_t m_ui_fps = 0.0f;
+  num_t m_ui_frameTime = 0.0f;
 
   // -- PROGRAM VARIABLES --
   size_t m_n_bodies = m_ui_n_bodies;
@@ -301,10 +312,10 @@ class NBodyApp
         m_sim.sync_queue();
 
         // Measure submission, execution and sync
-        auto tstart = std::chrono::high_resolution_clock::now();
+        auto tstart = fps_clock::now();
         m_sim.step();
         m_sim.sync_queue();
-        auto tend = std::chrono::high_resolution_clock::now();
+        auto tend = fps_clock::now();
 
         // Convert to seconds
         auto diff = tend - tstart;
@@ -327,6 +338,16 @@ class NBodyApp
   }
 
   void draw() override {
+    duration deltaTime = m_currentTime - m_previousTime;
+    if (deltaTime > duration{0}) {
+      m_previousTime = m_currentTime;
+      m_ui_frameTime =
+          std::chrono::duration_cast<std::chrono::milliseconds>(deltaTime)
+              .count();
+      m_ui_fps = 1.0f / (m_ui_frameTime / 1000.0f);
+    }
+    m_currentTime = fps_clock::now();
+
     ci::gl::clear();
 
     // Disable depth to avoid black outlines
@@ -372,6 +393,9 @@ class NBodyApp
 
     // Draw the UI
     ImGui::Begin("Simulation Settings");
+
+    ImGui::LabelText("FPS", "%4.3f", m_ui_fps);
+    ImGui::LabelText("Frame Time", "%4.3f ms", m_ui_frameTime);
 
     std::array<const char*, 3> forces = {
         {"Gravity", "Lennard-Jones", "Coulomb"}};
@@ -501,4 +525,8 @@ class NBodyApp
   }
 };
 
-CINDER_APP(NBodyApp, ci::app::RendererGl(ci::app::RendererGl::Options{}))
+CINDER_APP(NBodyApp, ci::app::RendererGl(ci::app::RendererGl::Options{}),
+           [&](ci::app::AppBase::Settings* settings) {
+             // Disable vsync
+             settings->disableFrameRate();
+           });

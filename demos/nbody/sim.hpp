@@ -27,6 +27,8 @@
 
 #pragma once
 
+#define WRAP(x, m) (((x) < m) ? (x) : (x - m))
+
 #include <iostream>
 #include <memory>
 #include <random>
@@ -133,8 +135,8 @@ class GravSim {
   integrator_t m_integrator;
 
   // Base constructor, does not initialize simulation values
-  GravSim(size_t n_bodies) :
-        m_q(sycl::default_selector{}, except_handler),
+  GravSim(size_t n_bodies)
+      : m_q(sycl::default_selector{}, except_handler),
         m_bufs(n_bodies),
         m_n_bodies(n_bodies),
         m_time(0),
@@ -274,82 +276,80 @@ class GravSim {
           num_t G = m_grav_params.G;
           num_t damping = m_grav_params.damping;
 
-          static constexpr num_t p = 256;
+          static constexpr num_t tileSize = 128;
 
           sycl::accessor<vec3<num_t>, 1, sycl::access::mode::read_write,
                          sycl::access::target::local>
-              shared(sycl::range<1>(256), cgh);
+              shared(sycl::range<1>(tileSize), cgh);
 
           sycl::range<1> global(m_n_bodies);
-          sycl::range<1> local(m_n_bodies / p);
+          sycl::range<1> local(tileSize);
           sycl::nd_range range(global, local);
 
-          cgh.parallel_for<kernel<num_t, 0>>(
-              range, [=](cl::sycl::nd_item<1> item) {
+          cgh.parallel_for<kernel<num_t, 0>>(range, [=](cl::sycl::nd_item<1>
+                                                            item) {
+            size_t id = item.get_global_linear_id();
 
-                size_t id = item.get_global_linear_id();
-                size_t N = item.get_global_range()[0];
+            size_t localId = item.get_local_id()[0];
+            size_t groupId = item.get_group_linear_id();
+            size_t numGroups = item.get_local_range()[0];
+            size_t groupRange = item.get_group_range(0);
 
-                size_t localId = item.get_local_linear_id();
-                size_t groupId = item.get_group_linear_id();
-                size_t numGroups = item.get_num_groups()[0];
+            // Computes the gravitational acceleration on a body using the
+            // chosen constants
+            const auto grav = [&](vec3<num_t>, vec3<num_t> x,
+                                  num_t) -> vec3<num_t> {
+              vec3<num_t> acc(0);
 
-                // Computes the gravitational acceleration on a body using the
-                // chosen constants
-                const auto grav = [&](vec3<num_t>, vec3<num_t> x,
-                                      num_t) -> vec3<num_t> {
-                  vec3<num_t> acc(0);
+#if 0
 
-                  #if 1
+              for (size_t i = 0, tile = 0; i < n_bodies; i += tileSize, tile++) {
+                shared[localId] =
+                    pos[((groupId + tile) % groupRange) * numGroups + localId];
+                item.barrier(sycl::access::fence_space::local_space);
+                for (size_t j = 0; j < tileSize; ++j) {
+                  const vec3<num_t> diff = shared[j] - x;
+                  const num_t r = sycl::length(diff);
+                  acc +=
+                      diff / (r * r * r +
+                              num_t{1e24} * static_cast<num_t>(r == num_t{0}) +
+                              damping);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+              }
 
-                  size_t start = 0;
-                  size_t tile = 0;
-                  size_t finish = N;
-
-                  #define WRAP(x, m) (((x) < m) ? (x) : (x - m))
-
-                  for (size_t i = 0; i < finish; i += p, tile++) {
-                    shared[localId] = pos[WRAP(groupId + tile, numGroups) * numGroups + localId];
-                    item.barrier(sycl::access::fence_space::local_space);
-                    for (size_t j = 0; j < p; ++j) {
-                      const vec3<num_t> diff = shared[localId] - x;
-                      const num_t r = sycl::sqrt(sycl::dot(diff, diff));
-                      acc += diff / (r * r * r + num_t(1e24) + damping);
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
-                  }
-
-                  #else
+#else
                   for (size_t i = 0; i < n_bodies; i++) {
-                    auto const diff = pos[i] - x;
-                    auto const r = sycl::sqrt(sycl::dot(diff, diff));
+                    const vec3<num_t> diff = pos[i] - x;
+                    // const num_t r = sycl::sqrt(diff.x() * diff.x() + diff.y() * diff.y() + diff.z() * diff.z());
+                    // const num_t r = sycl::sqrt(sycl::dot(diff, diff));
+                    const num_t r = sycl::length(diff);
+                    // const num_t r = sycl::fast_length(diff);
                     acc += diff /
                            (r * r * r + num_t(1e24) * num_t(i == id) + damping);
                   }
-                  #endif
+#endif
 
-                  return G * acc;
-                };
+              return G * acc;
+            };
 
-                vec3<num_t> wvelTmp;
-                vec3<num_t> wposTmp;
+            vec3<num_t> wvelTmp;
+            vec3<num_t> wposTmp;
 
-                // Use the chosen integrator to find new values of position and
-                // velocity
-                if (integrator == integrator_t::EULER) {
-                  std::tie(wvelTmp, wposTmp, std::ignore) =
-                      integrate_step_euler(grav, STEP_SIZE, vel[id], pos[id],
-                                           t);
+            // Use the chosen integrator to find new values of position and
+            // velocity
+            if (integrator == integrator_t::EULER) {
+              std::tie(wvelTmp, wposTmp, std::ignore) =
+                  integrate_step_euler(grav, STEP_SIZE, vel[id], pos[id], t);
 
-                } else if (integrator == integrator_t::RK4) {
-                  std::tie(wvelTmp, wposTmp, std::ignore) =
-                      integrate_step_rk4(grav, STEP_SIZE, vel[id], pos[id], t);
+            } else if (integrator == integrator_t::RK4) {
+              std::tie(wvelTmp, wposTmp, std::ignore) =
+                  integrate_step_rk4(grav, STEP_SIZE, vel[id], pos[id], t);
+            }
 
-                }
-
-                wvel[id] = wvelTmp;
-                wpos[id] = wposTmp;
-              });
+            wvel[id] = wvelTmp;
+            wpos[id] = wposTmp;
+          });
         } break;
         case force_t::LENNARD_JONES: {
           // Dummy copies
@@ -398,8 +398,8 @@ class GravSim {
                       integrate_step_rk4(force, STEP_SIZE, vel[id], pos[id], t);
                 }
 
-                 wvel[id] = wvelTmp;
-                 wpos[id] = wposTmp;
+                wvel[id] = wvelTmp;
+                wpos[id] = wposTmp;
               });
         } break;
         case force_t::COULOMB: {
